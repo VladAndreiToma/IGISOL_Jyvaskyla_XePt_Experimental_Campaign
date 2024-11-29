@@ -1,0 +1,216 @@
+#include "DetectorConstruction.hh"
+
+using namespace std;
+
+DetectorConstruction::DetectorConstruction(RunInput* rinp): G4VUserDetectorConstruction(), runInput(rinp) {
+  G4cout<<"IGISOL setup construction:"<<G4endl;
+  if(!runInput->IgisolMNT()) {G4cout<<"DetectorConstruction - ERROR: using wrong setup!"<<G4endl; exit(-1);}
+  BasePath = std::getenv("IonCatchersPath");
+  
+  nist = G4NistManager::Instance();   // Get nist material manager
+  // vacuum (H at extremely low density):
+  G4double vaccDens = 1.e-25*g/cm3; // minimum density in Geant4
+  G4double vaccTemp = 300.*kelvin;
+  G4double vaccPres = vaccDens*vaccTemp/(1.911674*(g*kelvin/joule));
+  m_vac = new G4Material("Vacuum", 1., 1.008*g/mole, vaccDens, kStateGas, vaccTemp, vaccPres);
+  // He gas: 300mbar+70K=0.206mg/cm3; 200mbar+80K=0.120mg/cm3; 100mbar+90K=0.053mg/cm3
+  G4double cellPres = runInput->GetCellPres();
+  G4double cellTemp = runInput->GetCellTemp();
+  G4double cellDens = 0.481429*(g*kelvin/joule)*cellPres/cellTemp;
+  m_gas = new G4Material("G4_He", 2., 4.003*g/mole, cellDens, kStateGas, cellTemp, cellPres);
+  // target:
+  m_targ = nist->FindOrBuildMaterial(runInput->TargNistName());
+  if(!m_targ) {G4cout<<"DetectorConstruction - ERROR: undefined target material!"<<G4endl; exit(-1);}
+}
+
+DetectorConstruction::~DetectorConstruction() {
+  delete m_vac;
+  delete m_gas;
+  delete m_targ;
+}
+
+// constructs the IGISOL setup with window foil at (0,0,0):
+G4VPhysicalVolume* DetectorConstruction::Construct() {  
+  G4bool doOverlap = true;   // Option to switch on/off checking of volumes overlaps
+
+  // geometry parameters:
+  G4double hallHalfXY=3.*m, hallHalfZ=3.*m;
+  G4double cellHalfXY=93.*mm, cellHalfZ=50.*mm;
+  G4double cellCentZ=40.*mm;
+  G4double cellCut = 5.75*mm; // depth of cut in gas cell to make room for window structures
+  G4double dWindTarg =  runInput->GetDistTH(); // distance window - target
+  G4double dWindWheel = 68.*mm; // initial (CAD) distance window - target wheel
+  G4double windThick = runInput->GetWindowThick();
+  G4double windDiam = 97.*mm;
+  G4double windShift = -0.015*mm;
+  G4double pipeDiam=9.87*mm;
+  G4String  targName = runInput->TargName();
+  G4double targThick  = runInput->GetTargThick();
+  G4double targz = -dWindTarg;
+  G4double targLength = 17.*mm;
+  G4double targWidth  = 13.*mm;
+  G4double targAng = 90.*deg;
+  G4double testThick  = 0.001*mm;
+  G4double testDisp = 0.01*mm;
+
+  // EXPERIMENTAL HALL (= WORLD VOLUME):
+  G4Box* hallShape = new G4Box("hallShape", hallHalfXY, hallHalfXY, hallHalfZ); 
+  G4LogicalVolume* logicHall = new G4LogicalVolume(hallShape, m_vac, "logicHall", 0, 0, 0);
+  G4VPhysicalVolume* expHall = new G4PVPlacement(0, G4ThreeVector(0.*mm,0.*mm,0.*mm), logicHall, "Hall", 0, false, 0);
+  
+  // GET LOCATION OF THE WINDOW FOIL FROM ITS CAD STRUCTURE - USE IT TO CENTER WHOLE SETUP
+  G4String WindStructFile = BasePath; WindStructFile += "/SETUPS/IGISOL/Foil.stl";
+  CADMesh* WindStructMesh =  new CADMesh((char*)WindStructFile.data(),(char*) "STL");
+  if(!WindStructMesh) {G4cout<<"DetectorConstruction - Error: Cannot build window foil structure mesh."<<G4endl; exit(-1);}
+  WindStructMesh->SetScale(mm); WindStructMesh->SetReverse(false); //  WindStructMesh->SetOffset(G4ThreeVector);
+  G4cout<<"Window foil mesh created from CAD file:"<<WindStructFile<<G4endl;
+  G4VSolid* WindStructSolid = WindStructMesh->TessellatedMesh(); // must come first (creates tesselated solid)
+  if(!WindStructSolid) {G4cout<<"DetectorConstruction - Error: Cannot build window foil tesselated solid."<<G4endl; exit(-1);}
+  G4double WindSize[3] = {0.*mm};
+  G4Point3D WindStructCenter = GetStructCenter(WindStructMesh, WindSize);
+
+  // BUILD WINDOW FOIL AT (0,0,0):
+  G4Material* m_wind = nist->FindOrBuildMaterial("G4_Ni");
+  // G4Material* m_wind = new G4Material("G4_Havar", 8.3*g/cm3, 7);
+  // m_wind->AddMaterial(nist->FindOrBuildMaterial("G4_Co"), 42.5*perCent);
+  // m_wind->AddMaterial(nist->FindOrBuildMaterial("G4_Cr"), 19.5*perCent);
+  // m_wind->AddMaterial(nist->FindOrBuildMaterial("G4_Ni"), 12.7*perCent);
+  // m_wind->AddMaterial(nist->FindOrBuildMaterial("G4_W"), 2.8*perCent);
+  // m_wind->AddMaterial(nist->FindOrBuildMaterial("G4_Mo"), 2.6*perCent);
+  // m_wind->AddMaterial(nist->FindOrBuildMaterial("G4_Mn"), 1.6*perCent);
+  // m_wind->AddMaterial(nist->FindOrBuildMaterial("G4_Fe"), 18.3*perCent);
+  if(!m_wind) {G4cout<<"DetectorConstruction - ERROR: window material not found!"<<G4endl; exit(-1);}
+  G4Tubs*  WindShape = new G4Tubs("WindShape", 0.*mm, 0.5*windDiam, 0.5*windThick, 0.*deg, 360.*deg);
+  G4LogicalVolume* logicWind = new G4LogicalVolume(WindShape, m_wind, "WindowVolume");
+  G4cout<<"Window: "<<m_wind->GetName()<<"("<<m_wind->GetDensity()/(g/cm3)<<"g/cm3), (x,y,z)=(0,0,"<<windShift/mm
+	<<") [mm], thick="<<windThick/mm<<"mm, diam="<<windDiam/mm<<"mm"<<G4endl;
+  new G4PVPlacement(0, G4ThreeVector(0.*mm, 0.*mm, windShift), logicWind, "Window", logicHall, false, 0, doOverlap);
+
+  // BUILD TARGET IN FRONT OF THE TARGET WHEEL HOLE:
+  G4Box* targShape = new G4Box("TargShape", 0.5*targLength, 0.5*targWidth, 0.5*targThick);
+  G4LogicalVolume* logicTarg = new G4LogicalVolume(targShape, m_targ, "TargVolume");
+  G4RotationMatrix* targRot = new G4RotationMatrix(0.*deg, 0.*deg, 0.*deg);
+  targRot->rotateZ(targAng);
+  G4cout<<"Targ : "<<m_targ->GetName()<<"("<<m_targ->GetDensity()/(g/cm3)<<"g/cm3), (x,y,z)=(0,0,"<<targz/mm
+	<<") [mm], thick="<<targThick/mm<<"mm, lengthXwidth="<<targLength/mm<<"X"<<targWidth/mm<<"mm"<<G4endl;
+  new G4PVPlacement(targRot, G4ThreeVector(0.*mm, 0.*mm, targz), logicTarg, "Targ", logicHall, false, 0, doOverlap);
+  // PLACE BEAM SOURCE 1MM BEHIND TARGET:
+  G4cout<<"Beam source placed at: z="<<(targz/mm-1.*mm)<<"mm"<<G4endl;
+  runInput->SetSourceZ(targz-1.*mm);
+  runInput->SetSourceR(0.5*runInput->GetBeamPWidth()/mm);
+
+  // STOPPING CELL - contains Body, BeamPipe, Extraction Block:
+  G4Material* m_cell = 0;
+  if(runInput->RunMode0()) m_cell = m_vac;
+  else m_cell = m_gas;
+  // subtract cylinder to make space for window foil holding structures:
+  G4Box* cellBox = new G4Box("cellBox", cellHalfXY, cellHalfXY, cellHalfZ);
+  G4Tubs* cellCyl = new G4Tubs("cellCyl", 0.*mm, 0.5*(windDiam+0.85*mm),  2.*cellCut, 0.*deg, 360.*deg);
+  G4VSolid* cellShape = new G4SubtractionSolid("cellShape", cellBox, cellCyl, 0, G4ThreeVector(0.,0.,-cellHalfZ));
+  G4LogicalVolume* logicCell = new G4LogicalVolume(cellShape, m_cell, "CellVolume");
+  G4RotationMatrix* cellRot = new G4RotationMatrix(0.*deg, 0.*deg, 0.*deg);
+  cellRot->rotateZ(180.*deg);
+  new G4PVPlacement(cellRot, G4ThreeVector(0.*mm, 0.*mm, cellCentZ), logicCell, "Cell", logicHall, false, 0, doOverlap);
+  G4cout<<"GAS CELL: "<<m_cell->GetName()<<"("<<m_cell->GetDensity()/(mg/cm3)<<"mg/cm3), (x,y,z)=(0,0,"<<cellCentZ/mm
+	<<") [mm], size (X,Y,Z)="<<2.*cellHalfXY/mm<<","<<2.*cellHalfXY/mm<<","<<2.*cellHalfZ/mm<<" [mm]"<<G4endl;
+
+  // BUILD TEST LAYERS:
+  // 1st test layer = sheet after target and target wheel
+  G4double testCenter1 = targz+4.*mm + testDisp + 0.5*testThick; // target wheel thickness~4mm
+  G4Box* testShape1 = new G4Box("TestShape1", 0.5*(targLength+1.*mm), 0.5*(targWidth+1.*mm), 0.5*testThick);
+  G4LogicalVolume* logicTest1 = new G4LogicalVolume(testShape1, m_vac, "TestVolume1");
+  new G4PVPlacement(targRot, G4ThreeVector(0.*mm, 0.*mm, testCenter1), logicTest1, "Test1", logicHall, false, 0, doOverlap);
+  // 2nd test layer = disk before window foil and its outer holder
+  G4double testCenter2 = windShift-1.5*mm-testDisp-0.5*testThick; // holder thickness~1.5mm
+  G4Tubs* testShape2  = new G4Tubs("TestShape2", 0.*mm, 0.5*(windDiam-6.8*mm), testThick, 0.*deg, 360.*deg);
+  G4LogicalVolume* logicTest2 = new G4LogicalVolume(testShape2, m_vac, "TestVolume2");
+  new G4PVPlacement(0, G4ThreeVector(0.*mm, 0.*mm, testCenter2), logicTest2, "Test2", logicHall, false, 0, doOverlap);
+  // 3rd test layer = sheet after window foil and its inner holder
+  G4double testCenter3 = windShift+1.5*mm+testDisp+0.5*testThick;
+  G4Tubs* testShape3  = new G4Tubs("TestShape3", 0.*mm, 0.5*windDiam, testThick, 0.*deg, 360.*deg);
+  G4LogicalVolume* logicTest3 = new G4LogicalVolume(testShape3, m_vac, "TestVolume3");
+  new G4PVPlacement(0, G4ThreeVector(0.*mm, 0.*mm, testCenter3), logicTest3, "Test3", logicHall, false, 0, doOverlap);
+  G4cout<<"TEST LAYERS: "<<m_vac->GetName()<<"("<<m_vac->GetDensity()/(mg/cm3)<<"mg/cm3)"<<G4endl;
+  G4cout<<"   1st (after target) center="<<testCenter1/cm<<"cm, thickness="<<testThick/mm<<"mm"<<G4endl;
+  G4cout<<"   2nd (before window) center="<<testCenter2/cm<<"cm, thickness="<<testThick/mm<<"mm"<<G4endl;
+  G4cout<<"   3rd (after window) center="<<testCenter3/cm<<"cm, thickness="<<testThick/mm<<"mm"<<G4endl;
+  
+  // load all STL structures declared in the AConfigCAD.inp for the corresponding setup:
+  G4Material* m_struct  = nist->FindOrBuildMaterial("G4_STAINLESS-STEEL");
+  std::ifstream confFile;
+  G4String pathToFile = BasePath; pathToFile += "/SETUPS/IGISOL/AConfigCAD.inp";
+  confFile.open(pathToFile, ios::in | ios::binary);
+  if(!confFile) {G4cout<<"DetectorConstruction - Error: Cannot open the geometry configuration file."<<G4endl; exit(-1);}
+  G4int nImp;
+  confFile>>nImp;
+  const G4int NumStruct = nImp;
+  G4String StructName, MotherName, StructFile;
+  G4int writeOut=0;
+  G4double posx=0.*mm, posy=0.*mm, posz=0.*mm;
+  G4double rotx=0.*deg, roty=0.*deg, rotz=0.*deg;
+  CADMesh* StructMesh[NumStruct];
+  G4LogicalVolume* logicMother;
+  G4ThreeVector StructPos;
+  for(G4int iS=0; iS<NumStruct; iS++) {
+    confFile>>StructName>>writeOut>>MotherName>>posx>>posy>>posz>>rotx>>roty>>rotz;
+    if(StructName=="") {G4cout<<"DetectorConstruction - Error: empty input structure."<<G4endl; exit(-1);}
+    posx *= mm; posy *= mm; posz *= mm; rotx *= deg; roty *= deg; rotz *= deg;
+    if(writeOut) runInput->RegisterVolume(StructName);   // register for output storage
+    G4cout<<"Structure:"<<StructName<<"("<<m_struct->GetName()<<", "<<m_struct->GetDensity()/(g/cm3)<<"g/cm3), Mother:"<<MotherName
+	  <<", writeOut="<<writeOut<<G4endl
+	  <<"   pos(x,y,z)=("<<posx/mm<<","<<posy/mm<<","<<posz/mm<<")"<<" rot(x,y,z)=("<<rotx/deg<<","<<roty/deg<<","<<rotz/deg<<")"<<G4endl;
+    StructFile = BasePath; StructFile += "/SETUPS/IGISOL/"; StructFile += StructName; StructFile += ".stl";
+    StructMesh[iS] =  new CADMesh((char*)StructFile.data(),(char*) "STL");
+    if(!StructMesh[iS]) {G4cout<<"DetectorConstruction - Error: Cannot build structure mesh."<<G4endl; exit(-1);}
+    StructMesh[iS]->SetScale(mm); StructMesh[iS]->SetReverse(false); //  StructMesh[iS]->SetOffset(G4ThreeVector);
+    G4VSolid* StructSolid = StructMesh[iS]->TessellatedMesh(); // must come first (creates tesselated solid)
+    G4double StructSize[3] = {0.*mm};
+    G4Point3D StructCenter = GetStructCenter(StructMesh[iS], StructSize);
+    G4RotationMatrix* StructRot = new G4RotationMatrix(0.*deg, 0.*deg, 0.*deg);
+    StructRot->rotateX(rotx); StructRot->rotateY(roty); StructRot->rotateZ(rotz);
+    G4double StructPosX = posx+WindStructCenter.z()/mm;
+    G4double StructPosY = posy-WindStructCenter.y()/mm;
+    G4double StructPosZ = posz-WindStructCenter.x()/mm;
+    if(MotherName=="Hall"){
+      logicMother = logicHall;
+    } else if(MotherName=="Cell"){
+      logicMother = logicCell;
+      StructPosZ -= 0.5*StructSize[0];
+    } else {G4cout<<"DetectorConstruction - Error: unkown mother name "<<MotherName<<G4endl; exit(-1);}
+    if(StructName=="TargetWheel") StructPosZ += (dWindWheel+targz+targThick);  // move target  wheel with target
+    if(StructName=="PressingFlange") StructRot->rotateY(180*deg);
+    G4cout<<"   StructPos: X="<<StructPosX/mm<<", Y="<<StructPosY/mm<<", Z="<<StructPosZ/mm<<", SizeX="<<StructSize[0]/mm<<G4endl;
+    StructPos = G4ThreeVector(StructPosX, StructPosY, StructPosZ);
+    if(StructName=="BeamPipe") {   // define volume inside beam pipe
+      G4Tubs* pipeShape = new G4Tubs("pipeShape", 0.*mm, 0.5*pipeDiam, 0.5*(StructSize[0]+0.7*mm), 0.*deg, 360.*deg);
+      G4LogicalVolume* logicPipe = new G4LogicalVolume(pipeShape, m_vac, "PipeVolume");
+      new G4PVPlacement(0, G4ThreeVector(0.*mm, 0.*mm, -2.9*mm), logicPipe, "Pipe", logicCell, false, 0, doOverlap);
+    }
+    G4String VolumeName = StructName; VolumeName += "Volume";
+    G4LogicalVolume* StructLogical = new G4LogicalVolume(StructSolid, m_struct, VolumeName);
+    new G4PVPlacement(StructRot, StructPos, StructLogical, StructName, logicMother, false, 0, doOverlap);
+  }
+  confFile.close();
+  
+  return expHall;   // always return the physical World
+}
+
+// declares sensitive volumes and constructs EM fields: 
+void DetectorConstruction::ConstructSDandField(){}
+
+// returns the 3D center point of a CADMesh:
+G4Point3D DetectorConstruction::GetStructCenter(CADMesh* StructMesh, G4double* Size) {
+  G4TessellatedSolid* StructTess = StructMesh->GetSolid();
+  if(StructTess->GetSolidClosed())  G4cout<<"   tesselated solid with "<<StructTess->GetNumberOfFacets()<<" facets loaded..."<<G4endl;
+  else G4cout<<"DetectorConstruction - WARNING: tesselated solid not closed!"<<G4endl;
+  G4VisExtent StructVis = StructTess->GetExtent();
+  G4cout<<"   Span: x=("<<StructVis.GetXmin()<<", "<<StructVis.GetXmax()<<");";
+  G4cout<<" y=("<<StructVis.GetYmin()<<", "<<StructVis.GetYmax()<<");";
+  G4cout<<" z=("<<StructVis.GetZmin()<<", "<<StructVis.GetZmax()<<")"<<G4endl;
+  Size[0] = (StructVis.GetXmax()-StructVis.GetXmin())/mm;
+  Size[1] = (StructVis.GetYmax()-StructVis.GetYmin())/mm;
+  Size[2] = (StructVis.GetZmax()-StructVis.GetZmin())/mm;
+  G4Point3D ExtentCenter = StructVis.GetExtentCentre();
+  G4cout<<"   center (x,y,z)=("<<ExtentCenter.x()/mm<<", "<<ExtentCenter.y()/mm<<", "<<ExtentCenter.z()/mm<<") [mm]"<<G4endl;
+  return ExtentCenter;
+}
